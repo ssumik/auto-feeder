@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "build/auto-feeder.ino.bin"
+elf = "build/auto-feeder.ino.elf"
