@@ -5,13 +5,7 @@
   "parts": [
     { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
     { "type": "wokwi-servo", "id": "servo", "top": -40, "left": 220, "attrs": {} },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "ir",
-      "top": 180,
-      "left": 220,
-      "attrs": { "color": "blue", "label": "Sensor IR (grao)", "bounce": "0" }
-    }
+    { "type": "wokwi-photoresistor-sensor", "id": "ldr", "top": 180, "left": 220, "attrs": {} }
   ],
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
@@ -19,8 +13,9 @@
     [ "servo:PWM", "esp:18", "orange", [] ],
     [ "servo:V+", "esp:5V", "red", [] ],
     [ "servo:GND", "esp:GND.2", "black", [] ],
-    [ "ir:1.l", "esp:27", "green", [] ],
-    [ "ir:2.l", "esp:GND.1", "black", [] ]
+    [ "ldr:VCC", "esp:3V3", "red", [] ],
+    [ "ldr:GND", "esp:GND.1", "black", [] ],
+    [ "ldr:AO", "esp:34", "green", [] ]
   ],
   "dependencies": {}
 }

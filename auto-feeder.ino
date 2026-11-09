@@ -2,16 +2,21 @@
 // PetFeeder IoT - alimentador remoto de ração (ESP32)
 //
 // Comando (dashboard -> Adafruit IO -> ESP32 -> servo) e telemetria
-// (sensor IR -> ESP32 -> Adafruit IO -> dashboard), conforme a Etapa 2.
+// (sensor LDR -> ESP32 -> Adafruit IO -> dashboard), conforme a Etapa 2.
+// O sensor IR FC-51 previsto foi trocado por uma barreira de luz
+// (LED branco + LDR); ver a seção do sensor abaixo.
 //
 // Bibliotecas: ESP32Servo, PubSubClient (WiFi, Preferences e time são do core).
 // Parâmetros em config.h; credenciais em secrets.h (ver secrets.example.h).
 //
 // Comandos pela Serial (115200 baud), para testes de bancada e calibração:
+//   d        dispensa a quantidade configurada
 //   d <g>    dispensa <g> gramas (mesmas regras do comando remoto)
+//   q <g>    define e salva a quantidade por dispensa (publica em pf-quantidade)
 //   abrir    abre a comporta e zera a contagem (calibração)
 //   fechar   fecha a comporta e mostra a contagem
 //   s        mostra o estado atual
+//   ldr      liga/desliga a leitura contínua do LDR (alinhamento e ajuste)
 //   zerar    zera o total do dia
 // =====================================================================
 #include <WiFi.h>
@@ -40,34 +45,77 @@ Estado estado = INICIANDO;
 unsigned long inicioEstadoMs = 0;
 
 // ---------------------------------------------------------------------
-// Sensor IR: contagem por interrupção com debounce
+// Sensor: barreira de luz com LED branco + LDR (substitui o FC-51)
+//
+// O LED ilumina o LDR através do cano. A ração que cai faz sombra e a
+// leitura de luz cai abaixo da linha de base. O LDR é lento demais para
+// separar grãos que caem juntos, então em vez de contar grãos o firmware
+// soma a sombra ao longo do tempo (área abaixo da linha de base). Essa
+// soma é proporcional à quantidade que passou e vale também para fluxo
+// contínuo. Cada LDR_ESCALA de sombra acumulada vira 1 "unidade", e
+// GRAMAS_POR_UNIDADE converte unidades em gramas (calibração).
+//
+// A leitura roda numa tarefa própria, a cada LDR_PERIODO_MS, para não
+// depender do tempo do loop (Wi-Fi/MQTT).
 // ---------------------------------------------------------------------
-volatile uint32_t contagemSensor = 0;
-volatile unsigned long ultimoPulsoUs = 0;
+volatile int luzAtual = 0;          // última leitura (0 = escuro, 4095 = muita luz)
+volatile float luzBase = 0;         // linha de base (média móvel com o cano vazio)
+volatile bool medindo = false;      // true enquanto a comporta está aberta
+volatile int baseFixa = 0;          // linha de base congelada no início da medição
+volatile uint64_t sombraAcumulada = 0;
 portMUX_TYPE muxSensor = portMUX_INITIALIZER_UNLOCKED;
 
-void IRAM_ATTR isrSensor() {
-  unsigned long agora = micros();
-  if (agora - ultimoPulsoUs >= DEBOUNCE_SENSOR_US) {
-    portENTER_CRITICAL_ISR(&muxSensor);
-    contagemSensor = contagemSensor + 1;
-    portEXIT_CRITICAL_ISR(&muxSensor);
-  }
-  ultimoPulsoUs = agora;
+int lerLuz() {
+  int v = analogRead(PINO_LDR);
+  return LDR_MAIS_LUZ_MAIOR ? v : 4095 - v;
 }
+
+void tarefaSensor(void *) {
+  luzBase = lerLuz();
+  TickType_t proximo = xTaskGetTickCount();
+  for (;;) {
+    int luz = lerLuz();
+    luzAtual = luz;
+    if (medindo) {
+      int sombra = baseFixa - luz - LDR_ZONA_MORTA;
+      if (sombra > 0) {
+        portENTER_CRITICAL(&muxSensor);
+        sombraAcumulada += sombra;
+        portEXIT_CRITICAL(&muxSensor);
+      }
+    } else {
+      luzBase += (luz - luzBase) / 64.0f;  // acompanha a luz ambiente devagar
+    }
+    vTaskDelayUntil(&proximo, pdMS_TO_TICKS(LDR_PERIODO_MS));
+  }
+}
+
+void iniciarSensor() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(PINO_LDR, ADC_11db);
+  xTaskCreatePinnedToCore(tarefaSensor, "sensor", 2048, nullptr, 2, nullptr, 1);
+}
+
+// Sensor com pouca luz na base = LED apagado, LDR solto ou desalinhado.
+bool sensorOk() { return luzBase >= LDR_BASE_MIN; }
 
 uint32_t lerContagem() {
   portENTER_CRITICAL(&muxSensor);
-  uint32_t n = contagemSensor;
+  uint64_t s = sombraAcumulada;
   portEXIT_CRITICAL(&muxSensor);
-  return n;
+  return (uint32_t)(s / LDR_ESCALA);
 }
 
+// Zera a contagem, congela a linha de base atual e começa a medir.
 void zerarContagem() {
   portENTER_CRITICAL(&muxSensor);
-  contagemSensor = 0;
+  sombraAcumulada = 0;
+  baseFixa = (int)luzBase;
+  medindo = true;
   portEXIT_CRITICAL(&muxSensor);
 }
+
+void pararMedicao() { medindo = false; }
 
 uint32_t contagemParaGramas(uint32_t n) {
   return (uint32_t)lroundf(n * GRAMAS_POR_UNIDADE);
@@ -86,7 +134,8 @@ void abrirComporta()  { servoComporta.write(ANGULO_ABERTA); }
 // ---------------------------------------------------------------------
 Preferences prefs;
 
-int metaGramas = QTD_PADRAO_G;     // último valor recebido do slider
+int metaGramas = QTD_PADRAO_G;     // quantidade configurada (salva em NVS)
+bool metaJaSalva = false;          // false = primeira vez: publicar o padrão no feed
 int metaAtual = 0;                 // meta da dispensa em andamento
 uint32_t totalDiaG = 0;
 uint32_t diaDoTotal = 0;           // AAAAMMDD; 0 = data ainda desconhecida
@@ -129,6 +178,7 @@ struct Pendente {
 };
 Pendente pendentes[] = {
   {FEED_STATUS, "", false},
+  {FEED_MENSAGEM, "", false},
   {FEED_CONTAGEM, "", false},
   {FEED_GRAMAS, "", false},
   {FEED_TOTAL_DIA, "", false},
@@ -159,8 +209,38 @@ void enviarPendentes() {
   }
 }
 
-void publicarStatus(const String &corpo) {
-  publicar(FEED_STATUS, corpo + ";dev=" DEVICE_ID);
+// pf-status recebe só o estado: ocioso, dispensando, concluido, timeout ou erro.
+void publicarStatus(const char *estadoAtual) {
+  publicar(FEED_STATUS, estadoAtual);
+}
+
+// Códigos publicados em pf-mensagem, no formato "<código>: <mensagem>".
+#define ERRO_OCUPADO        "E01"  // R2: dispensa em andamento, cooldown ou comporta manual
+#define ERRO_QUANTIDADE     "E02"  // R3: quantidade fora da faixa
+#define ERRO_LIMITE_DIARIO  "E03"  // R4: total do dia + meta passa do limite
+#define ERRO_SENSOR         "E04"  // sensor LDR sem luz (LED apagado ou LDR solto)
+#define ERRO_TIMEOUT        "E05"  // R6: tempo máximo com quantidade parcial
+#define ERRO_SEM_FLUXO      "E06"  // R7: tempo máximo sem nenhuma ração detectada
+
+void publicarErro(const char *codigo, const String &mensagem) {
+  publicar(FEED_MENSAGEM, String(codigo) + ": " + mensagem);
+}
+
+// Altera a quantidade por dispensa e a mantém após reinícios (NVS).
+// Valores fora da faixa são ignorados e a quantidade anterior continua valendo.
+void definirMeta(int gramas, bool publicarNoFeed) {
+  if (gramas < QTD_MIN_G || gramas > QTD_MAX_G) {
+    Serial.printf("[meta] %d g fora da faixa (%d a %d), mantendo %d g\n",
+                  gramas, QTD_MIN_G, QTD_MAX_G, metaGramas);
+    return;
+  }
+  if (gramas != metaGramas || !metaJaSalva) {
+    metaGramas = gramas;
+    prefs.putInt("meta", metaGramas);
+    metaJaSalva = true;
+    Serial.printf("[meta] quantidade salva: %d g\n", metaGramas);
+  }
+  if (publicarNoFeed) publicar(FEED_QUANTIDADE, String(metaGramas));
 }
 
 // ---------------------------------------------------------------------
@@ -173,41 +253,54 @@ void mudarEstado(Estado novo) {
 }
 
 // Regras R1 a R4: valida e inicia uma dispensa.
+// Um pedido recusado não muda o estado: só publica o motivo em pf-mensagem.
+// CONCLUIDO aceita um novo pedido na hora; ERRO aguarda o cooldown.
 void pedirDispensa(int gramas) {
-  if (estado != OCIOSO || comporta_manual) {                       // R2
-    publicarStatus("recusado;motivo=ocupado");
+  bool livre = (estado == OCIOSO || estado == CONCLUIDO) && !comporta_manual;
+  if (!livre) {                                                    // R2
+    publicarErro(ERRO_OCUPADO, "recusado, equipamento ocupado (" +
+                 String(NOMES_ESTADO[estado]) + ")");
     return;
   }
   if (gramas < QTD_MIN_G || gramas > QTD_MAX_G) {                  // R3
-    publicarStatus("recusado;motivo=quantidade;meta=" + String(gramas));
+    publicarErro(ERRO_QUANTIDADE, "recusado, quantidade " + String(gramas) +
+                 " g fora da faixa de " + String(QTD_MIN_G) + " a " + String(QTD_MAX_G) + " g");
     return;
   }
   if (totalDiaG + (uint32_t)gramas > LIMITE_DIARIO_G) {            // R4
-    publicarStatus("recusado;motivo=limite_diario;meta=" + String(gramas) +
-                   ";total=" + String(totalDiaG));
+    publicarErro(ERRO_LIMITE_DIARIO, "recusado, limite diario: " + String(totalDiaG) +
+                 " g + " + String(gramas) + " g passa de " + String(LIMITE_DIARIO_G) + " g");
+    return;
+  }
+  if (!sensorOk()) {                                               // sensor sem luz
+    publicarErro(ERRO_SENSOR, "recusado, sensor sem luz (leitura " +
+                 String((int)luzBase) + ", minimo " + String(LDR_BASE_MIN) + ")");
     return;
   }
   metaAtual = gramas;                                              // R1
   zerarContagem();
   abrirComporta();
   mudarEstado(DISPENSANDO);
-  publicarStatus("dispensando;meta=" + String(metaAtual));
+  publicarStatus("dispensando");
 }
 
 // Fecha a comporta e publica o resultado (R5, R6, R7).
 void finalizarDispensa(const char *resultado) {
   fecharComporta();
+  pararMedicao();
   uint32_t n = lerContagem();
   uint32_t g = contagemParaGramas(n);
 
   totalDiaG += g;
   salvarTotal();
 
-  String corpo = String(resultado);
-  if (strcmp(resultado, "erro") == 0) corpo += ";motivo=sem_fluxo";
-  corpo += ";meta=" + String(metaAtual) + ";g=" + String(g) + ";n=" + String(n);
-
-  publicarStatus(corpo);
+  publicarStatus(resultado);
+  if (strcmp(resultado, "timeout") == 0) {
+    publicarErro(ERRO_TIMEOUT, "tempo maximo atingido, liberados " + String(g) +
+                 " de " + String(metaAtual) + " g");
+  } else if (strcmp(resultado, "erro") == 0) {
+    publicarErro(ERRO_SEM_FLUXO, "sem fluxo de racao (reservatorio vazio ou cano entupido)");
+  }
   publicar(FEED_CONTAGEM, String(n));
   publicar(FEED_GRAMAS, String(g));
   publicar(FEED_TOTAL_DIA, String(totalDiaG));
@@ -233,14 +326,14 @@ void atualizarEstado() {
     case ERRO:
       if (decorrido >= COOLDOWN_MS) {
         mudarEstado(OCIOSO);
-        publicarStatus("ocioso;total=" + String(totalDiaG));
+        publicarStatus("ocioso");
       }
       break;
     case OCIOSO: {
       static unsigned long ultimoOciosoMs = 0;
       if (millis() - ultimoOciosoMs >= STATUS_OCIOSO_MS) {
         ultimoOciosoMs = millis();
-        publicarStatus("ocioso;total=" + String(totalDiaG));
+        publicarStatus("ocioso");
       }
       break;
     }
@@ -281,7 +374,7 @@ void aoReceberMqtt(char *topicoRecebido, byte *payload, unsigned int tamanho) {
 
   String t(topicoRecebido);
   if (t == topico(FEED_QUANTIDADE)) {
-    metaGramas = (int)lroundf(valor.toFloat());
+    definirMeta((int)lroundf(valor.toFloat()), false);
   } else if (t == topico(FEED_COMANDO)) {
     if (valor == "1") pedirDispensa(metaGramas);  // "0" é o próprio reset do ESP32
   }
@@ -324,9 +417,15 @@ bool conectarMqtt() {
   mqtt.subscribe(topico(FEED_QUANTIDADE).c_str());
   mqtt.subscribe((String(AIO_USUARIO) + "/errors").c_str());
   mqtt.subscribe((String(AIO_USUARIO) + "/throttle").c_str());
-  // Pede o último valor do slider (o Adafruit IO não usa mensagens retidas).
-  mqtt.publish((topico(FEED_QUANTIDADE) + "/get").c_str(), "");
   enviarPendentes();
+  if (!metaJaSalva) {
+    // Primeira execução: grava o padrão no feed para o slider começar nele.
+    definirMeta(metaGramas, true);
+  } else {
+    // Pede o último valor do slider, caso tenha mudado com o ESP32 desligado
+    // (o Adafruit IO não usa mensagens retidas).
+    mqtt.publish((topico(FEED_QUANTIDADE) + "/get").c_str(), "");
+  }
   return true;
 }
 
@@ -393,9 +492,32 @@ void mostrarEstado() {
                 NOMES_ESTADO[estado], metaGramas, (unsigned long)totalDiaG,
                 (unsigned long)diaDoTotal, (unsigned long)lerContagem(),
                 (unsigned long)contagemParaGramas(lerContagem()));
+  Serial.printf("luz=%d base=%d (minimo %d) sensor=%s\n", luzAtual, (int)luzBase,
+                LDR_BASE_MIN, sensorOk() ? "ok" : "SEM LUZ");
   Serial.printf("wifi=%s mqtt=%s\n",
                 WiFi.status() == WL_CONNECTED ? "ok" : "off",
                 mqtt.connected() ? "ok" : "off");
+}
+
+// Publica a leitura do LDR em pf-luz a cada LUZ_INTERVALO_MS. Valores antigos
+// não ficam pendentes: sem conexão, a leitura é só mostrada na Serial.
+void publicarLuz() {
+  static unsigned long ultimoMs = 0;
+  if (millis() - ultimoMs < LUZ_INTERVALO_MS) return;
+  ultimoMs = millis();
+  publicar(FEED_LUZ, String(luzAtual));
+}
+
+// Liga/desliga com o comando "ldr": mostra a leitura a cada 200 ms,
+// para alinhar o LED com o LDR e escolher LDR_ZONA_MORTA / LDR_BASE_MIN.
+bool monitorLdr = false;
+
+void mostrarLdr() {
+  static unsigned long ultimoMs = 0;
+  if (!monitorLdr || millis() - ultimoMs < 200) return;
+  ultimoMs = millis();
+  Serial.printf("luz=%4d base=%4d sombra=%4d n=%lu\n", luzAtual, (int)luzBase,
+                max(0, (int)luzBase - luzAtual), (unsigned long)lerContagem());
 }
 
 void tratarSerial() {
@@ -409,10 +531,15 @@ void tratarSerial() {
     linha.trim();
     if (linha.length() == 0) continue;
 
-    if (linha.startsWith("d ")) {
+    if (linha == "d") {
+      pedirDispensa(metaGramas);
+    } else if (linha.startsWith("d ")) {
       pedirDispensa(linha.substring(2).toInt());
+    } else if (linha.startsWith("q ")) {
+      definirMeta(linha.substring(2).toInt(), true);
     } else if (linha == "abrir") {
       if (estado == OCIOSO) {
+        if (!sensorOk()) Serial.println("aviso: sensor com pouca luz, contagem nao confiavel");
         zerarContagem();
         abrirComporta();
         comporta_manual = true;
@@ -422,18 +549,21 @@ void tratarSerial() {
       }
     } else if (linha == "fechar") {
       fecharComporta();
+      pararMedicao();
       comporta_manual = false;
       uint32_t n = lerContagem();
       Serial.printf("comporta fechada: n=%lu, %lu g estimados (%.3f g/unid)\n",
                     (unsigned long)n, (unsigned long)contagemParaGramas(n), GRAMAS_POR_UNIDADE);
     } else if (linha == "s") {
       mostrarEstado();
+    } else if (linha == "ldr") {
+      monitorLdr = !monitorLdr;
     } else if (linha == "zerar") {
       totalDiaG = 0;
       salvarTotal();
       publicar(FEED_TOTAL_DIA, "0");
     } else {
-      Serial.println("comandos: d <g> | abrir | fechar | s | zerar");
+      Serial.println("comandos: d | d <g> | q <g> | abrir | fechar | s | ldr | zerar");
     }
     linha = "";
   }
@@ -453,14 +583,17 @@ void setup() {
   delay(200);
   Serial.println("\n=== PetFeeder IoT (" DEVICE_ID ") ===");
 
-  pinMode(PINO_SENSOR, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PINO_SENSOR), isrSensor, FALLING);
+  iniciarSensor();
 
   prefs.begin("petfeeder", false);
   totalDiaG = prefs.getUInt("total", 0);
   diaDoTotal = prefs.getUInt("dia", 0);
   Serial.printf("total do dia salvo: %lu g (dia %lu)\n",
                 (unsigned long)totalDiaG, (unsigned long)diaDoTotal);
+  metaJaSalva = prefs.isKey("meta");
+  metaGramas = prefs.getInt("meta", QTD_PADRAO_G);
+  Serial.printf("quantidade por dispensa: %d g%s\n", metaGramas,
+                metaJaSalva ? "" : " (padrao)");
 
   if (HABILITAR_REDE) iniciarRede();
   else Serial.println("modo local: rede desabilitada (config.h)");
@@ -474,4 +607,6 @@ void loop() {
   verificarVirada();
   atualizarEstado();
   atualizarLed();
+  mostrarLdr();
+  publicarLuz();
 }
