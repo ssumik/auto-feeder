@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Equipe PetFeeder IoT
 // =====================================================================
 // PetFeeder IoT - alimentador remoto de ração (ESP32)
 //

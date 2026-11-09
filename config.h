@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Equipe PetFeeder IoT
 // =====================================================================
 // PetFeeder IoT - parâmetros do firmware
 // Valores provisórios (Etapa 2, seção 11). Ajustar com os testes da Etapa 3.

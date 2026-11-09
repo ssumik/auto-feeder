@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Equipe PetFeeder IoT
 // =====================================================================
 // Modelo de credenciais. Copie para "secrets.h" e preencha.
 //   cp secrets.example.h secrets.h

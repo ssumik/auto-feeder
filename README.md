@@ -91,3 +91,10 @@ Um pedido recusado não muda o estado.
 
 Depois de `concluido` o equipamento aceita um novo pedido na hora. Depois de `timeout`
 ou `erro` ele aguarda o cooldown (`COOLDOWN_MS`) antes de aceitar outro.
+
+## Licença
+
+Distribuído sob a [Licença Apache 2.0](LICENSE).
+
+Copyright 2026 Equipe PetFeeder IoT: Gustavo Gabriel Paterno, Jean Carlo Menezes Cunha,
+Pedro Henrique Schuch, Gustavo Fontana Bertoldi e João Pedro Sumi Bebber.
